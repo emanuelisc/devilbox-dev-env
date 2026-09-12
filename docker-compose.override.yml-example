@@ -1,0 +1,194 @@
+# IMPORTANT: The version must match the version of docker-compose.yml
+#
+# Copy this file to `docker-compose.override.yml` (which is gitignored) and keep
+# only the sections you need. Verify the merged result with:
+#
+#   docker compose config --format json
+#
+---
+version: '2.3'
+
+services:
+
+  # ==========================================================================
+  # 1. Adding a custom service (upstream example: CockroachDB)
+  # ==========================================================================
+  cockroach:
+    image: cockroachdb/cockroach:latest
+    command: start --insecure
+    # Ensure the chosen ports are not occupied on the host system
+    ports:
+      - "${LOCAL_LISTEN_ADDR}26257:26257"
+      - "${LOCAL_LISTEN_ADDR}8080:8080"
+    networks:
+      app_net:
+        # Ensure to pick an IP address from docker-compose.yml network
+        # that is not yet taken by other sevices
+        ipv4_address: 172.16.238.200
+    # (Optional) For ease of use always automatically start these:
+    depends_on:
+      - bind
+      - php
+      - httpd
+
+  # ==========================================================================
+  # 2. Moving the databases off named volumes onto host bind mounts
+  # ==========================================================================
+  # Upstream keeps the data directories in NAMED VOLUMES, which are destroyed by
+  # `docker compose down -v`, `docker volume prune`, `docker system prune
+  # --volumes` and by any Docker Desktop reset or disk-image resize. A host
+  # directory survives all of that, and survives deleting the container itself.
+  #
+  # NOTE: a bind mount does NOT protect against InnoDB corruption -- corrupt
+  # pages are corrupt on the host too. That is what ./backup-databases.sh is for.
+  #
+  # data/*-datadir/ is gitignored. Never commit or copy a datadir while the
+  # service is running.
+
+  mysql:
+    volumes:
+      - ./data/mysql-datadir:/var/lib/mysql:rw
+      # Host-side SQL dumps, importable from inside the container.
+      - ${HOST_PATH_MYSQL_DATADIR:-./data/mysql}:/shared/mysql:rw${MOUNT_OPTIONS}
+      - ${HOST_PATH_BACKUPDIR:-./backups}:/shared/backups:rw${MOUNT_OPTIONS}
+
+  pgsql:
+    volumes:
+      # Must be /var/lib/postgresql/data/pgdata, NOT .../data: the base compose
+      # file sets $PGDATA to the pgdata subdirectory and mounts there. A
+      # mismatched target silently leaves the upstream named volume in place.
+      - ./data/pgsql-datadir:/var/lib/postgresql/data/pgdata:rw
+      - ${HOST_PATH_BACKUPDIR:-./backups}:/shared/backups:rw${MOUNT_OPTIONS}
+
+  mongo:
+    volumes:
+      - ./data/mongo-datadir:/data/db:rw
+
+  # PHP_MAIL_CATCH_ALL delivers intercepted mail to /var/mail, which the intranet
+  # reads. EVERY service mounting /var/mail must be switched together, or they
+  # end up looking at different spools.
+  php:
+    volumes:
+      - ./data/mail:/var/mail:rw
+
+  # ==========================================================================
+  # 3. Running additional PHP versions side by side
+  # ==========================================================================
+  # A project opts into one of these with a single-line
+  # data/www/<project>/.devilbox/backend.cfg, e.g.
+  #
+  #   conf:phpfpm:tcp:172.16.238.212:9000
+  #
+  # (requires .env:MASS_VHOST_BACKEND_REWRITE=file:backend.cfg). Pick free IPs in
+  # the 172.16.238.2xx range so upstream services keep theirs.
+
+  # --- A stock devilbox image, pinned to one version -------------------------
+  # Lets you raise .env:PHP_SERVER for everything else while legacy projects
+  # stay on the old version.
+  php71:
+    image: devilbox/php-fpm:7.1-work-0.150
+    hostname: php71
+    env_file:
+      - ./.env
+    environment:
+      - DEBUG_ENTRYPOINT=${DEBUG_ENTRYPOINT:-2}
+      - DOCKER_LOGS
+      - COMPOSER_MEMORY_LIMIT=-1
+      - NEW_UID
+      - NEW_GID
+      - TIMEZONE
+      - ENABLE_MODULES=${PHP_MODULES_ENABLE}
+      - DISABLE_MODULES=${PHP_MODULES_DISABLE}
+      - ENABLE_MAIL=${PHP_MAIL_CATCH_ALL:-2}
+      - FORWARD_PORTS_TO_LOCALHOST=80:httpd:80,443:httpd:443,3306:mysql:3306,5432:pgsql:5432,6379:redis:6379,11211:memcd:11211,27017:mongo:27017
+    dns:
+      - 172.16.238.100
+    networks:
+      app_net:
+        ipv4_address: 172.16.238.201
+    volumes:
+      # Must stay /shared/httpd: nginx sends SCRIPT_FILENAME as an absolute path
+      # under it, so every PHP container has to see the same mountpoint.
+      - ${HOST_PATH_HTTPD_DATADIR}:/shared/httpd:rw${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/cfg/php-ini-7.1:/etc/php-custom.d:ro${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/cfg/php-fpm-7.1:/etc/php-fpm-custom.d:ro${MOUNT_OPTIONS}
+      # Separate log dir so this container and `php` do not interleave into the
+      # same files when both run the same version.
+      - ${DEVILBOX_PATH}/log/php-fpm-7.1-pinned:/var/log/php:rw${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/bash:/etc/bashrc-devilbox.d:rw${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/ca:/ca:rw${MOUNT_OPTIONS}
+      - ${HOST_PATH_SSH_DIR}:/home/devilbox/.ssh:ro${MOUNT_OPTIONS}
+      - ${HOST_PATH_BACKUPDIR:-./backups}:/shared/backups:rw${MOUNT_OPTIONS}
+      - ./data/mail:/var/mail:rw
+    depends_on:
+      - bind
+
+  # --- A locally built image for a version upstream does not ship ------------
+  # devilbox/php-fpm has no 8.3+ tags, so this is built from docker/php84/.
+  # Build it explicitly after editing that directory:
+  #
+  #   docker compose build php84
+  php84:
+    build: ./docker/php84
+    image: devilbox-local/php-fpm:8.4
+    hostname: php84
+    env_file:
+      - ./.env
+    environment:
+      - NEW_UID
+      - NEW_GID
+      - TIMEZONE
+      - COMPOSER_MEMORY_LIMIT=-1
+    dns:
+      - 172.16.238.100
+    networks:
+      app_net:
+        ipv4_address: 172.16.238.212
+    volumes:
+      - ${HOST_PATH_HTTPD_DATADIR}:/shared/httpd:rw${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/cfg/php-ini-8.4:/etc/php-custom.d:ro${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/cfg/php-fpm-8.4:/etc/php-fpm-custom.d:ro${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/log/php-fpm-8.4:/var/log/php:rw${MOUNT_OPTIONS}
+      # Same shell drop-ins and CA store as the stock devilbox PHP containers.
+      - ${DEVILBOX_PATH}/bash:/etc/bashrc-devilbox.d:rw${MOUNT_OPTIONS}
+      - ${DEVILBOX_PATH}/ca:/ca:rw${MOUNT_OPTIONS}
+      # ./shell.sh runs as `devilbox`, so the keys have to land in that home.
+      - ${HOST_PATH_SSH_DIR}:/home/devilbox/.ssh:ro${MOUNT_OPTIONS}
+      - ${HOST_PATH_BACKUPDIR:-./backups}:/shared/backups:rw${MOUNT_OPTIONS}
+      - ./data/mail:/var/mail:rw
+    depends_on:
+      - bind
+
+  # --- The same again for 8.3 (docker/php83/) --------------------------------
+  # php83:
+  #   build: ./docker/php83
+  #   image: devilbox-local/php-fpm:8.3
+  #   hostname: php83
+  #   env_file:
+  #     - ./.env
+  #   environment:
+  #     - NEW_UID
+  #     - NEW_GID
+  #     - TIMEZONE
+  #     - COMPOSER_MEMORY_LIMIT=-1
+  #   dns:
+  #     - 172.16.238.100
+  #   networks:
+  #     app_net:
+  #       ipv4_address: 172.16.238.211
+  #   volumes:
+  #     - ${HOST_PATH_HTTPD_DATADIR}:/shared/httpd:rw${MOUNT_OPTIONS}
+  #     - ${DEVILBOX_PATH}/cfg/php-ini-8.3:/etc/php-custom.d:ro${MOUNT_OPTIONS}
+  #     - ${DEVILBOX_PATH}/cfg/php-fpm-8.3:/etc/php-fpm-custom.d:ro${MOUNT_OPTIONS}
+  #     - ${DEVILBOX_PATH}/log/php-fpm-8.3:/var/log/php:rw${MOUNT_OPTIONS}
+  #     - ${DEVILBOX_PATH}/bash:/etc/bashrc-devilbox.d:rw${MOUNT_OPTIONS}
+  #     - ${DEVILBOX_PATH}/ca:/ca:rw${MOUNT_OPTIONS}
+  #     - ${HOST_PATH_SSH_DIR}:/home/devilbox/.ssh:ro${MOUNT_OPTIONS}
+  #     - ${HOST_PATH_BACKUPDIR:-./backups}:/shared/backups:rw${MOUNT_OPTIONS}
+  #     - ./data/mail:/var/mail:rw
+  #   depends_on:
+  #     - bind
+
+# With the database data directories moved to host bind mounts above, there is
+# no top-level `volumes:` section left for Docker to own -- and nothing for a
+# stray `docker volume prune` to delete.
