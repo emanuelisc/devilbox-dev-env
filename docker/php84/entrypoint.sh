@@ -22,6 +22,11 @@ done
 if [ -n "${TIMEZONE}" ] && [ -f "/usr/share/zoneinfo/${TIMEZONE}" ]; then
 	ln -snf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
 	echo "${TIMEZONE}" > /etc/timezone
+	# PHP does not read /etc/localtime -- without date.timezone it stays on UTC
+	# and 8.4 projects report a different time than the stock devilbox
+	# containers. A cfg/php-ini-8.4/*.ini drop-in still wins over this: the
+	# leading ":" in PHP_INI_SCAN_DIR keeps /usr/local/etc/php/conf.d first.
+	printf 'date.timezone = %s\n' "${TIMEZONE}" > /usr/local/etc/php/conf.d/zz-devilbox-timezone.ini
 fi
 
 # *.dvl.to resolves to 127.0.0.1 (public wildcard), so container-to-container API
