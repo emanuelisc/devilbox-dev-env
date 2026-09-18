@@ -20,8 +20,8 @@ ADD --chmod=0755 \
     /usr/local/bin/
 
 RUN install-php-extensions \
-      bcmath calendar exif gd intl mysqli opcache pcntl \
-      pdo_mysql pdo_pgsql redis soap sockets xsl zip \
+      bcmath calendar exif gd intl memcached mysqli opcache pcntl \
+      pdo_mysql pdo_pgsql pgsql redis soap sockets xsl zip \
       @composer
 
 RUN install-php-extensions imagick mongodb xdebug
